@@ -1,0 +1,31 @@
+model:
+  name: dt
+  action_dim: 7
+  context_len: 30
+  hidden_size: 128
+  n_layer: 4
+  n_head: 4
+  dropout: 0.1
+  max_timestep: 50000
+
+dataset:
+  path: offline_trajectories
+  rtg_scale: 1000.0
+  max_trajectories: null
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.0001
+  beta1: 0.9
+  beta2: 0.95
+
+training:
+  seed: 0
+  device: auto
+  batch_size: 8
+  num_workers: 0
+  max_steps: 10000
+  grad_clip: 1.0
+  log_interval: 50
+  save_interval: 1000
+  checkpoint_dir: checkpoints/dt
