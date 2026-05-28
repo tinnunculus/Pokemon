@@ -1,0 +1,11 @@
+offline_trajectories/*
+__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg-info/
+.agents/*
+.codex/*
+.vscode/*
