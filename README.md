@@ -17,3 +17,8 @@ python main.py --model dt
 포켓몬 게임 즐기기
 
 pyboy red_rom/PokemonRed.gb
+
+
+
+*참고*
+100% GPT 작성이라 틀린 부분이 있을 수 있음. 논문 읽으면서 코드 작성/확인해보아요.
