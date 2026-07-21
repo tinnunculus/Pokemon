@@ -1,0 +1,35 @@
+model:
+  name: cql
+  action_dim: 7
+  hidden_size: 128
+  event_dim: 2488
+
+dataset:
+  path: offline_trajectories
+  max_trajectories: null
+
+algorithm:
+  gamma: 0.99
+  double_q: true
+  bellman_loss: huber
+  cql_alpha: 1.0
+  cql_temperature: 1.0
+  target_update_interval: 1000
+  tau: 1.0
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+
+training:
+  seed: 0
+  device: auto
+  batch_size: 32
+  num_workers: 4
+  max_steps: 10000
+  grad_clip: 10.0
+  log_interval: 50
+  save_interval: 1000
+  checkpoint_dir: checkpoints/cql

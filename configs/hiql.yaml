@@ -1,0 +1,29 @@
+model:
+  name: hiql
+  action_dim: 7
+  hidden_size: 256
+  discrete: 1
+  lr: 3e-4
+  actor_hidden_dims: (256, 256)
+  value_hidden_dims: (256, 256)
+  discount: 0.99
+  tau: 0.005
+  temperature: 1.0
+  high_temperature: 1.0
+  pretrain_expectile: 0.7
+  use_waypoints: 0
+  use_rep: 0
+  rep_dim: 64
+  policy_train_rep: 0
+
+dataset:
+  path: offline_trajectories
+  max_trajectories: null
+
+training:
+  seed: 0
+  batch_size: 64
+  max_steps: 10000
+  log_interval: 100
+  save_interval: 1000
+  checkpoint_dir: checkpoints/hiql

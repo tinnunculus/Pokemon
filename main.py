@@ -71,6 +71,10 @@ def main():
     args = parse_args()
     config_path = Path(args.config) if args.config else Path("configs") / f"{args.model}.yaml"
     config = load_simple_yaml(config_path)
+    
+    print(f"Loaded config from {config_path}:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
 
     overrides = {}
     for item in args.set:

@@ -1,4 +1,5 @@
 offline_trajectories/*
+checkpoints/
 __pycache__/*
 *.pyc
 *.pyo
