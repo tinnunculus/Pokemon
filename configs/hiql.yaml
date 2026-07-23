@@ -11,10 +11,15 @@ model:
   temperature: 1.0
   high_temperature: 1.0
   pretrain_expectile: 0.7
-  use_waypoints: 0
-  use_rep: 0
-  rep_dim: 64
+  # Enables the high-level policy.  This is a boolean flag; the number of
+  # environment decisions between a state and its waypoint is `way_steps`.
+  use_waypoints: 1
+  way_steps: 25
+  use_rep: 1
+  rep_dim: 10
   policy_train_rep: 0
+  use_layer_norm: 1
+  geom_sample: 1
 
 dataset:
   path: offline_trajectories
@@ -22,8 +27,9 @@ dataset:
 
 training:
   seed: 0
-  batch_size: 64
+  batch_size: 256
   max_steps: 10000
   log_interval: 100
   save_interval: 1000
-  checkpoint_dir: checkpoints/hiql
+  # Keep hierarchical checkpoints separate: flat checkpoints are incompatible.
+  checkpoint_dir: checkpoints/hiql_0722

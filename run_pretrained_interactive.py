@@ -93,6 +93,7 @@ if __name__ == "__main__":
             action = model.act(obs, device=DEVICE, deterministic=True)
             print(f"step={env.step_count}, action={int(np.asarray(action).item())}")
             obs, rewards, terminated, truncated, info = env.step(action)
+            print("rewards", rewards)
         else:
             env.pyboy.tick(1, True)
             obs = env._get_obs()

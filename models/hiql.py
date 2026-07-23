@@ -3,7 +3,9 @@ import random
 import time
 from pathlib import Path
 from tqdm.auto import tqdm
+from functools import partial
 import time
+import os
 
 from jaxrl_m.typing import *
 
@@ -13,6 +15,8 @@ import numpy as np
 import optax
 from jaxrl_m.common import TrainState, target_update
 from jaxrl_m.networks import Policy, Critic, ensemblize, DiscretePolicy
+from utils import CsvLogger
+
 
 import flax
 import flax.linen as nn
@@ -58,219 +62,169 @@ def flatten_observation_batch(obs):
     return np.concatenate(parts, axis=-1)
 
 
-class HiQLTransitionDataset:
-    def __init__(self,
-                 dataset_dir,
-                 max_trajectories=None,
-                 p_randomgoal=0.3,
-                 p_trajgoal=0.5,
-                 p_currgoal=0.2,
-                 geom_sample=0,
-                 discount=0.99,
-                 way_steps=0,
-                 high_p_randomgoal=0.0):
-        self.dataset_dir = Path(dataset_dir)
-        self.files = sorted(self.dataset_dir.glob("*.npz"))
+class HiQLDataset:
+    """Goal-conditioned HIQL batches backed by a directory of trajectories."""
+
+    def __init__(
+        self,
+        dataset_dir,
+        max_trajectories=None,
+        p_randomgoal=0.3,
+        p_trajgoal=0.5,
+        p_currgoal=0.2,
+        geom_sample=0,
+        discount=0.99,
+        way_steps=0,
+        high_p_randomgoal=0.0,
+        reward_scale=1.0,
+        reward_shift=0.0,
+        terminal=False,
+    ):
+        self.files = sorted(Path(dataset_dir).glob("*.npz"))
         if max_trajectories is not None:
-            self.files = self.files[: int(max_trajectories)]
+            self.files = self.files[:int(max_trajectories)]
         if not self.files:
-            raise FileNotFoundError(f"No .npz trajectories found in {self.dataset_dir}")
+            raise FileNotFoundError(f"No .npz trajectories found in {dataset_dir}")
 
-        self.lengths = []
+        lengths = []
         for path in self.files:
-            with np.load(path, mmap_mode='r') as data:
-                self.lengths.append(int(data["steps"]))
-        self.lengths = np.asarray(self.lengths, dtype=np.int64)
-        self.sample_probs = self.lengths / self.lengths.sum()
-
-        self._data_cache = {}
+            with np.load(path) as trajectory:
+                lengths.append(int(trajectory["steps"]))
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.terminal_locs = np.cumsum(self.lengths) - 1
 
         self.p_randomgoal = float(p_randomgoal)
         self.p_trajgoal = float(p_trajgoal)
         self.p_currgoal = float(p_currgoal)
-        self.geom_sample = int(geom_sample)
+        self.geom_sample = bool(geom_sample)
         self.discount = float(discount)
         self.way_steps = int(way_steps)
         self.high_p_randomgoal = float(high_p_randomgoal)
+        self.reward_scale = float(reward_scale)
+        self.reward_shift = float(reward_shift)
+        self.terminal = bool(terminal)
+        self._data_cache = {}
+
+        if not np.isclose(self.p_randomgoal + self.p_trajgoal + self.p_currgoal, 1.0):
+            raise ValueError("Goal sampling probabilities must sum to 1")
 
     def __len__(self):
-        return int(self.lengths.sum())
+        return int(self.terminal_locs[-1] + 1)
 
-    def _select_goal_index(self, data, current_index):
-        goal_locs = np.flatnonzero(data["obs_badges"][:, -1] == 1)
-        if len(goal_locs) == 0:
-            return int(data["steps"] - 1)
+    def _load(self, trajectory_index):
+        trajectory_index = int(trajectory_index)
+        if trajectory_index not in self._data_cache:
+            self._data_cache[trajectory_index] = np.load(self.files[trajectory_index])
+        return self._data_cache[trajectory_index]
 
-        if current_index <= goal_locs[0]:
-            return int(goal_locs[0])
-        if current_index >= goal_locs[-1]:
-            return int(goal_locs[-1])
+    def _locate(self, indices):
+        trajectory_indices = np.searchsorted(self.terminal_locs, indices)
+        starts = self.terminal_locs[trajectory_indices] - self.lengths[trajectory_indices] + 1
+        return trajectory_indices, indices - starts
 
-        return int(goal_locs[np.searchsorted(goal_locs, current_index)])
+    def _gather_observations(self, indices, prefix="obs"):
+        indices = np.asarray(indices, dtype=np.int64)
+        trajectory_indices, local_indices = self._locate(indices)
+        order = np.argsort(trajectory_indices, kind="stable")
+        split_points = np.flatnonzero(np.diff(trajectory_indices[order])) + 1
+        groups = np.split(order, split_points)
+        result = None
 
-    def _load_cached_data(self, path):
-        path_key = str(path)
-        if path_key not in self._data_cache:
-            load_start = time.time()
-            self._data_cache[path_key] = np.load(path, mmap_mode='r')
-            load_end = time.time()
-            # print(f"Loaded {path} in {load_end - load_start:.4f} seconds")
-        return self._data_cache[path_key]
+        for positions in groups:
+            trajectory_index = trajectory_indices[positions[0]]
+            trajectory = self._load(trajectory_index)
+            local = local_indices[positions]
+            observations = {
+                key: np.asarray(trajectory[f"{prefix}_{key}"][local])
+                for key in OBS_KEYS
+            }
 
-    def _sample_goal_index(self, data, current_index):
-        traj_len = int(data["steps"])
-        goal_locs = np.flatnonzero(data["obs_badges"][:, -1] == 1)
-        if len(goal_locs) == 0:
-            return int(traj_len - 1)
+            values = flatten_observation_batch(observations)
+            if result is None:
+                result = np.empty((len(indices), values.shape[1]), dtype=np.float32)
+            result[positions] = values
+        return result
 
-        final_state_index = int(goal_locs[-1])
-        random_goal_index = int(np.random.randint(traj_len))
+    def _gather_actions(self, indices):
+        trajectory_indices, local_indices = self._locate(indices)
+        actions = np.empty(len(indices), dtype=np.int64)
+        for trajectory_index in np.unique(trajectory_indices):
+            positions = np.flatnonzero(trajectory_indices == trajectory_index)
+            actions[positions] = self._load(trajectory_index)["actions"][local_indices[positions]]
+        return actions
 
-        if self.p_currgoal > 0 and np.random.rand() < self.p_currgoal:
-            return int(current_index)
-
-        if self.p_trajgoal > 0 and np.random.rand() < self.p_trajgoal / (1.0 - self.p_currgoal):
-            if self.geom_sample:
-                us = np.random.rand()
-                return int(np.minimum(current_index + np.ceil(np.log(1 - us) / np.log(self.discount)).astype(int), final_state_index))
-            distance = np.random.rand()
-            return int(np.round((np.minimum(current_index + 1, final_state_index) * distance + final_state_index * (1 - distance))).astype(int))
-
-        return int(random_goal_index)
-
-    def _sample_goal_index_batch(self, data, current_indices):
-        traj_len = int(data["steps"])
-        goal_locs = np.flatnonzero(data["obs_badges"][:, -1] == 1)
-        if len(goal_locs) == 0:
-            return np.full(current_indices.shape, traj_len - 1, dtype=np.int64)
-
-        final_state_index = int(goal_locs[-1])
-        random_goal_index = np.random.randint(traj_len, size=current_indices.shape)
-
-        goal_indices = np.empty_like(current_indices, dtype=np.int64)
-        curr_mask = (self.p_currgoal > 0) & (np.random.rand(current_indices.shape[0]) < self.p_currgoal)
-        traj_mask = (~curr_mask) & (self.p_trajgoal > 0) & (np.random.rand(current_indices.shape[0]) < self.p_trajgoal / (1.0 - self.p_currgoal))
-
-        goal_indices[curr_mask] = current_indices[curr_mask]
+    def sample_goals(self, indices):
+        batch_size = len(indices)
+        final_indices = self.terminal_locs[np.searchsorted(self.terminal_locs, indices)]
+        goals = np.random.randint(len(self), size=batch_size)
 
         if self.geom_sample:
-            us = np.random.rand(current_indices.shape[0])
-            new_goal_idx = np.minimum(
-                current_indices[traj_mask] + np.ceil(np.log(1 - us[traj_mask]) / np.log(self.discount)).astype(int),
-                final_state_index,
-            )
-            goal_indices[traj_mask] = new_goal_idx
+            offsets = np.ceil(
+                np.log1p(-np.random.rand(batch_size)) / np.log(self.discount)
+            ).astype(np.int64)
+            trajectory_goals = np.minimum(indices + offsets, final_indices)
         else:
-            distance = np.random.rand(current_indices.shape[0])
-            new_goal_idx = np.round((
-                np.minimum(current_indices[traj_mask] + 1, final_state_index) * distance[traj_mask]
-                + final_state_index * (1 - distance[traj_mask])
-            )).astype(int)
-            goal_indices[traj_mask] = new_goal_idx
+            distance = np.random.rand(batch_size)
+            trajectory_goals = np.rint(
+                np.minimum(indices + 1, final_indices) * distance
+                + final_indices * (1.0 - distance)
+            ).astype(np.int64)
 
-        goal_indices[~curr_mask & ~traj_mask] = random_goal_index[~curr_mask & ~traj_mask]
-        return goal_indices
+        trajectory_probability = self.p_trajgoal / (1.0 - self.p_currgoal)
+        goals = np.where(
+            np.random.rand(batch_size) < trajectory_probability,
+            trajectory_goals,
+            goals,
+        )
+        return np.where(np.random.rand(batch_size) < self.p_currgoal, indices, goals)
 
-    def _sample_one(self, data=None):
-        if data is None:
-            traj_idx = int(np.random.choice(len(self.files), p=self.sample_probs))
-            path = self.files[traj_idx]
-            data = self._load_cached_data(path)
+    def sample(self, batch_size, indx=None):
+        indices = (
+            np.random.randint(len(self), size=batch_size)
+            if indx is None
+            else np.asarray(indx, dtype=np.int64)
+        )
+        batch_size = len(indices)
+        goal_indices = self.sample_goals(indices)
+        final_indices = self.terminal_locs[np.searchsorted(self.terminal_locs, indices)]
+        way_indices = np.minimum(indices + self.way_steps, final_indices)
 
-        traj_len = int(data["steps"])
-        index = int(np.random.randint(traj_len))
-        goal_index = self._sample_goal_index(data, index)
-        final_state_index = int(np.flatnonzero(data["obs_badges"][:, -1] == 1)[-1]) if np.any(data["obs_badges"][:, -1] == 1) else int(traj_len - 1)
-
-        obs = {key: data[f"obs_{key}"][index] for key in OBS_KEYS}
-        next_obs = {key: data[f"next_obs_{key}"][index] for key in OBS_KEYS}
-        goal_obs = {key: data[f"obs_{key}"][goal_index] for key in OBS_KEYS}
-
-        observations = flatten_observation(obs)
-        next_observations = flatten_observation(next_obs)
-        goals = flatten_observation(goal_obs)
-
-        success = np.float32(1.0 if index == goal_index else 0.0)
-        low_goal_index = int(np.minimum(index + self.way_steps, final_state_index))
-        low_goal_obs = {key: data[f"obs_{key}"][low_goal_index] for key in OBS_KEYS}
-        low_goals = flatten_observation(low_goal_obs)
-
-        high_goal_index = goal_index
-        high_target_index = int(np.minimum(index + self.way_steps, final_state_index))
-        if self.high_p_randomgoal > 0 and np.random.rand() < self.high_p_randomgoal:
-            high_goal_index = int(np.random.randint(traj_len))
-            high_target_index = int(np.minimum(index + self.way_steps, final_state_index))
-
-        high_goal_obs = {key: data[f"obs_{key}"][high_goal_index] for key in OBS_KEYS}
-        high_target_obs = {key: data[f"obs_{key}"][high_target_index] for key in OBS_KEYS}
-        high_goals = flatten_observation(high_goal_obs)
-        high_targets = flatten_observation(high_target_obs)
-
-        return {
-            "observations": observations,
-            "next_observations": next_observations,
-            "actions": np.int64(data["actions"][index]),
-            "rewards": success,
-            "masks": np.float32(1.0 - success),
-            "goals": goals,
-            "low_goals": low_goals,
-            "high_goals": high_goals,
-            "high_targets": high_targets,
-        }
-
-    def __getitem__(self, _):
-        return self._sample_one()
-
-    def sample_batch(self, batch_size):
-        traj_idx = int(np.random.choice(len(self.files), p=self.sample_probs))
-        path = self.files[traj_idx]
-        data = self._load_cached_data(path)
-
-        traj_len = int(data["steps"])
-        indices = np.random.randint(traj_len, size=batch_size)
-        goal_indices = self._sample_goal_index_batch(data, indices)
-        final_state_index = int(np.flatnonzero(data["obs_badges"][:, -1] == 1)[-1]) if np.any(data["obs_badges"][:, -1] == 1) else int(traj_len - 1)
-
-        obs = {key: data[f"obs_{key}"][indices] for key in OBS_KEYS}
-        next_obs = {key: data[f"next_obs_{key}"][indices] for key in OBS_KEYS}
-        goal_obs = {key: data[f"obs_{key}"][goal_indices] for key in OBS_KEYS}
-
-        observations = flatten_observation_batch(obs)
-        next_observations = flatten_observation_batch(next_obs)
-        goals = flatten_observation_batch(goal_obs)
+        distance = np.random.rand(batch_size)
+        high_trajectory_goals = np.rint(
+            np.minimum(indices + 1, final_indices) * distance
+            + final_indices * (1.0 - distance)
+        ).astype(np.int64)
+        # GCSDataset semantics: sample a distant future high-level goal, then
+        # train its target at most way_steps ahead without passing that goal.
+        high_trajectory_targets = np.minimum(
+            indices + self.way_steps, high_trajectory_goals
+        )
+        random_high_goals = np.random.randint(len(self), size=batch_size)
+        use_random_high_goal = np.random.rand(batch_size) < self.high_p_randomgoal
+        high_goal_indices = np.where(
+            use_random_high_goal, random_high_goals, high_trajectory_goals
+        )
+        high_target_indices = np.where(
+            use_random_high_goal, way_indices, high_trajectory_targets
+        )
 
         success = (indices == goal_indices).astype(np.float32)
-        low_goal_indices = np.minimum(indices + self.way_steps, final_state_index)
-        low_goal_obs = {key: data[f"obs_{key}"][low_goal_indices] for key in OBS_KEYS}
-        low_goals = flatten_observation_batch(low_goal_obs)
-
-        high_goal_indices = goal_indices
-        high_target_indices = np.minimum(indices + self.way_steps, final_state_index)
-        if self.high_p_randomgoal > 0:
-            pick_random = np.random.rand(batch_size) < self.high_p_randomgoal
-            high_goal_indices = np.where(pick_random, np.random.randint(traj_len, size=batch_size), high_goal_indices)
-
-        high_goal_obs = {key: data[f"obs_{key}"][high_goal_indices] for key in OBS_KEYS}
-        high_target_obs = {key: data[f"obs_{key}"][high_target_indices] for key in OBS_KEYS}
-        high_goals = flatten_observation_batch(high_goal_obs)
-        high_targets = flatten_observation_batch(high_target_obs)
-
-        batch = {
-            "observations": observations,
-            "next_observations": next_observations,
-            "actions": np.asarray(data["actions"][indices], dtype=np.int64),
-            "rewards": success,
-            "masks": np.float32(1.0 - success),
-            "goals": goals,
-            "low_goals": low_goals,
-            "high_goals": high_goals,
-            "high_targets": high_targets,
-        }
+        masks = (
+            1.0 - success
+            if self.terminal
+            else np.ones(batch_size, dtype=np.float32)
+        )
         return {
-            key: jnp.asarray(value)
-            for key, value in batch.items()
+            "observations": self._gather_observations(indices),
+            "next_observations": self._gather_observations(indices, prefix="next_obs"),
+            "actions": self._gather_actions(indices),
+            "rewards": success * self.reward_scale + self.reward_shift,
+            "masks": masks,
+            "goals": self._gather_observations(goal_indices),
+            "low_goals": self._gather_observations(way_indices),
+            "high_goals": self._gather_observations(high_goal_indices),
+            "high_targets": self._gather_observations(high_target_indices),
         }
-
 
 def expectile_loss(adv, diff, expectile=0.7):
     weight = jnp.where(adv >= 0, expectile, (1 - expectile))
@@ -442,36 +396,6 @@ class JointTrainAgent(iql.IQLAgent):
         return actions
     sample_actions = jax.jit(sample_actions, static_argnames=('num_samples', 'low_dim_goals', 'discrete'))
 
-    def act(agent, obs, device="cpu", deterministic=True, temperature: float = 1.0):
-        if isinstance(obs, dict):
-            observations = flatten_observation(obs)
-        else:
-            observations = np.asarray(obs, dtype=np.float32)
-
-        if observations.ndim == 1:
-            observations = observations[None, :]
-
-        goals = observations
-        discrete = int(agent.config.get('discrete', 0))
-
-        if deterministic:
-            dist = agent.network(observations, goals, low_dim_goals=False, temperature=temperature, method='actor')
-            action = dist.mode()
-        else:
-            seed = jax.random.PRNGKey(0)
-            action = agent.sample_actions(observations, goals, seed=seed, temperature=temperature, discrete=discrete)
-
-        if hasattr(action, 'shape') and len(action.shape) > 1:
-            action = action[0]
-
-        if hasattr(action, 'item'):
-            try:
-                return action.item()
-            except Exception:
-                pass
-
-        return np.asarray(action)
-
     def sample_high_actions(agent,
                             observations: np.ndarray,
                             goals: np.ndarray,
@@ -627,7 +551,7 @@ def get_default_config():
 def save_checkpoint(path, agent, step):
     checkpoint_dir = Path(path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    with open(checkpoint_dir / f"checkpoint_{step:09d}.msgpack", "wb") as f:
+    with open(checkpoint_dir / f"hiql_{step}.msgpack", "wb") as f:
         f.write(flax.serialization.to_bytes(agent))
 
 
@@ -636,7 +560,7 @@ def train(config):
     random.seed(seed)
     np.random.seed(seed)
 
-    dataset = HiQLTransitionDataset(
+    pretrain_dataset = HiQLDataset(
         dataset_dir=_get(config, "dataset.path", "offline_trajectories"),
         max_trajectories=_get(config, "dataset.max_trajectories", None),
         way_steps=int(_get(config, "model.way_steps", 0)),
@@ -648,7 +572,7 @@ def train(config):
         high_p_randomgoal=float(_get(config, "model.high_p_randomgoal", 0.0)),
     )
 
-    print("\ndataset size:", len(dataset))
+    print("\ndataset size:", len(pretrain_dataset))
 
     batch_size = int(_get(config, "training.batch_size", 64))
     max_steps = int(_get(config, "training.max_steps", 10000))
@@ -658,7 +582,7 @@ def train(config):
 
 
     one_sampling_start = time.time()
-    obs_dim = dataset.sample_batch(1)["observations"].shape[-1]
+    obs_dim = pretrain_dataset.sample(1)["observations"].shape[-1]
     one_sampling_end = time.time()
     print(f"One batch sampling time: {one_sampling_end - one_sampling_start:.4f} seconds")
 
@@ -690,14 +614,19 @@ def train(config):
         use_waypoints=int(_get(config, "model.use_waypoints", 0)),
     )
 
-    print("\n Environment and agent initialized. Starting pretraining...\n")
-
-    for step in tqdm(range(1, max_steps + 1), desc="HIQL Training", unit="step"):
+    print("\n Agent initialized. Starting pretraining...\n")
+    
+    for step in tqdm(range(1, max_steps + 1), 
+                     desc="HIQL Training", 
+                     unit="step", 
+                     dynamic_ncols=True):
         # print("step:", step)
         batch_sampling_start = time.time()
-        batch = dataset.sample_batch(batch_size)
+        batch = pretrain_dataset.sample(batch_size)
         batch_sampling_end = time.time()
-        # print(f"Batch sampling time: {batch_sampling_end - batch_sampling_start:.4f} seconds")
+
+        if step == 1:
+            print(f"Batch sampling time: {batch_sampling_end - batch_sampling_start:.4f} seconds")
         
         """
         
@@ -719,16 +648,26 @@ def train(config):
                 f"final badge observation: {batch_np['goals'][0][-10:]}"
             )
         """
+        pre_train_s = time.time()
+        agent, info = agent.pretrain_update(
+            batch,
+            seed=seed,
+            high_actor_update=bool(agent.config['use_waypoints']),
+        )
+        pre_train_t = time.time()
 
-        agent, info = agent.pretrain_update(batch, seed=seed + step, value_update=True, actor_update=True, high_actor_update=False)
+        if step == 1:
+            pre_train_time = pre_train_t - pre_train_s
+            print(f"agent 1 step update time : {pre_train_time:.4f}s", pre_train_time)
 
         if step % log_interval == 0 or step == 1:
             info = tree_map(lambda x: float(np.asarray(x)) if isinstance(x, (np.ndarray, jnp.ndarray)) else x, info)
             info_str = " ".join([f"{k}={v:.6f}" for k, v in info.items()])
+            # policy_rep_fn = agent.get_policy_rep
+            # base_observation = jax.tree_map(lambda arr: arr[0], pretrain_dataset.dataset['observations'])
             print(f"step={step} {info_str}")
             # progress.set_postfix_str(info_str)
 
         if step % save_interval == 0 or step == max_steps:
             save_checkpoint(checkpoint_dir, agent, step)
             print(f"saved checkpoint step={step} to {checkpoint_dir}")
-
