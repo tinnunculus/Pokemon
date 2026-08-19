@@ -79,6 +79,7 @@ class HiQLDataset:
         reward_scale=1.0,
         reward_shift=0.0,
         terminal=False,
+        trajectories_per_batch=None,
     ):
         self.files = sorted(Path(dataset_dir).glob("*.npz"))
         if max_trajectories is not None:
@@ -86,12 +87,12 @@ class HiQLDataset:
         if not self.files:
             raise FileNotFoundError(f"No .npz trajectories found in {dataset_dir}")
 
-        lengths = []
+        lengths = []    # 각 trajectory별 step 수를 저장하는 리스트
         for path in self.files:
             with np.load(path) as trajectory:
                 lengths.append(int(trajectory["steps"]))
         self.lengths = np.asarray(lengths, dtype=np.int64)
-        self.terminal_locs = np.cumsum(self.lengths) - 1
+        self.terminal_locs = np.cumsum(self.lengths) - 1    # 전체 데이터셋에서 각 trajectory의 마지막 step index를 저장하는 배열
 
         self.p_randomgoal = float(p_randomgoal)
         self.p_trajgoal = float(p_trajgoal)
@@ -103,13 +104,23 @@ class HiQLDataset:
         self.reward_scale = float(reward_scale)
         self.reward_shift = float(reward_shift)
         self.terminal = bool(terminal)
+        self.trajectories_per_batch = (
+            None
+            if trajectories_per_batch is None
+            else int(trajectories_per_batch)
+        )
         self._data_cache = {}
 
         if not np.isclose(self.p_randomgoal + self.p_trajgoal + self.p_currgoal, 1.0):
             raise ValueError("Goal sampling probabilities must sum to 1")
+        if (
+            self.trajectories_per_batch is not None
+            and self.trajectories_per_batch < 1
+        ):
+            raise ValueError("trajectories_per_batch must be at least 1")
 
     def __len__(self):
-        return int(self.terminal_locs[-1] + 1)
+        return int(self.terminal_locs[-1] + 1)   # 전체 step 수 (모든 trajectory의 step 수 합)
 
     def _load(self, trajectory_index):
         trajectory_index = int(trajectory_index)
@@ -122,41 +133,137 @@ class HiQLDataset:
         starts = self.terminal_locs[trajectory_indices] - self.lengths[trajectory_indices] + 1
         return trajectory_indices, indices - starts
 
-    def _gather_observations(self, indices, prefix="obs"):
-        indices = np.asarray(indices, dtype=np.int64)
-        trajectory_indices, local_indices = self._locate(indices)
-        order = np.argsort(trajectory_indices, kind="stable")
-        split_points = np.flatnonzero(np.diff(trajectory_indices[order])) + 1
-        groups = np.split(order, split_points)
-        result = None
+    def _sample_random_indices(self, size):
+        """Sample globally uniform steps using a small trajectory pool.
 
-        for positions in groups:
-            trajectory_index = trajectory_indices[positions[0]]
+        Selecting trajectories proportional to their lengths and then selecting
+        local steps uniformly preserves the marginal distribution of the old
+        ``np.random.randint(len(self))`` sampler. Limiting the pool only adds
+        correlation within a batch, which prevents compressed trajectory files
+        from being opened and decompressed hundreds of times per update.
+        """
+        if self.trajectories_per_batch is None:
+            return np.random.randint(len(self), size=size)
+
+        pool_size = min(self.trajectories_per_batch, len(self.files))
+        trajectory_pool = np.random.choice(
+            len(self.files),
+            size=pool_size,
+            replace=True,
+            p=self.lengths / len(self),
+        )
+        selected_trajectories = trajectory_pool[
+            np.random.randint(pool_size, size=size)
+        ]
+        local_indices = (
+            np.random.rand(size) * self.lengths[selected_trajectories]
+        ).astype(np.int64)
+        starts = (
+            self.terminal_locs[selected_trajectories]
+            - self.lengths[selected_trajectories]
+            + 1
+        )
+        return starts + local_indices
+
+    def _gather_batch(self, observation_requests, action_indices=None):
+        """Gather all fields for a batch while reading each NPZ member once.
+
+        ``observation_requests`` maps an output name to ``(indices, prefix)``.
+        Requests that use the same prefix (for example observations and goals)
+        are merged per trajectory before the corresponding NPZ arrays are read.
+        """
+        requests = {}
+        trajectory_parts = []
+        for name, (indices, prefix) in observation_requests.items():
+            indices = np.asarray(indices, dtype=np.int64)
+            trajectory_indices, local_indices = self._locate(indices)
+            requests[name] = (indices, prefix, trajectory_indices, local_indices)
+            trajectory_parts.append(trajectory_indices)
+
+        action_request = None
+        if action_indices is not None:
+            action_indices = np.asarray(action_indices, dtype=np.int64)
+            action_trajectories, action_locals = self._locate(action_indices)
+            action_request = (action_indices, action_trajectories, action_locals)
+            trajectory_parts.append(action_trajectories)
+
+        results = {name: None for name in requests}
+        if action_request is not None:
+            results["actions"] = np.empty(len(action_indices), dtype=np.int64)
+
+        if not trajectory_parts or not any(len(part) for part in trajectory_parts):
+            return results
+
+        used_trajectories = np.unique(np.concatenate(trajectory_parts))
+        for trajectory_index in used_trajectories:
+            # All observation/goal/action requests for this trajectory share
+            # this single archive lookup.
             trajectory = self._load(trajectory_index)
-            local = local_indices[positions]
-            observations = {
-                key: np.asarray(trajectory[f"{prefix}_{key}"][local])
-                for key in OBS_KEYS
-            }
 
-            values = flatten_observation_batch(observations)
-            if result is None:
-                result = np.empty((len(indices), values.shape[1]), dtype=np.float32)
-            result[positions] = values
-        return result
+            requests_by_prefix = {}
+            for name, (_, prefix, trajectory_indices, local_indices) in requests.items():
+                positions = np.flatnonzero(trajectory_indices == trajectory_index)
+                if len(positions):
+                    requests_by_prefix.setdefault(prefix, []).append(
+                        (name, positions, local_indices[positions])
+                    )
+
+            for prefix, prefix_requests in requests_by_prefix.items():
+                all_local_indices = np.concatenate(
+                    [local_indices for _, _, local_indices in prefix_requests]
+                )
+                unique_local_indices, inverse = np.unique(
+                    all_local_indices, return_inverse=True
+                )
+
+                # An NPZ member is decompressed when it is accessed. Reading
+                # every observation member here avoids decompressing it again
+                # for observations, goals, low_goals, and high_goals.
+                observations = {
+                    key: np.asarray(trajectory[f"{prefix}_{key}"])[
+                        unique_local_indices
+                    ]
+                    for key in OBS_KEYS
+                }
+                values = flatten_observation_batch(observations)
+
+                offset = 0
+                for name, positions, local_indices in prefix_requests:
+                    count = len(local_indices)
+                    if results[name] is None:
+                        results[name] = np.empty(
+                            (len(requests[name][0]), values.shape[1]),
+                            dtype=np.float32,
+                        )
+                    results[name][positions] = values[inverse[offset:offset + count]]
+                    offset += count
+
+            if action_request is not None:
+                _, action_trajectories, action_locals = action_request
+                positions = np.flatnonzero(action_trajectories == trajectory_index)
+                if len(positions):
+                    results["actions"][positions] = np.asarray(
+                        trajectory["actions"]
+                    )[action_locals[positions]]
+
+        return results
+
+    def _gather_observations(self, indices, prefix="obs"):
+        return self._gather_batch(
+            {"observations": (indices, prefix)}
+        )["observations"]
 
     def _gather_actions(self, indices):
-        trajectory_indices, local_indices = self._locate(indices)
-        actions = np.empty(len(indices), dtype=np.int64)
-        for trajectory_index in np.unique(trajectory_indices):
-            positions = np.flatnonzero(trajectory_indices == trajectory_index)
-            actions[positions] = self._load(trajectory_index)["actions"][local_indices[positions]]
-        return actions
+        return self._gather_batch({}, action_indices=indices)["actions"]
 
     def sample_goals(self, indices):
         batch_size = len(indices)
-        final_indices = self.terminal_locs[np.searchsorted(self.terminal_locs, indices)]
-        goals = np.random.randint(len(self), size=batch_size)
+
+        # Goals from the same trajectory
+        final_indices = self.terminal_locs[np.searchsorted(self.terminal_locs, indices)]   # 선택된 각 trajectory의 마지막 step index를 가져온다.
+
+        # Random goals
+        goals = self._sample_random_indices(batch_size)
 
         if self.geom_sample:
             offsets = np.ceil(
@@ -180,7 +287,7 @@ class HiQLDataset:
 
     def sample(self, batch_size, indx=None):
         indices = (
-            np.random.randint(len(self), size=batch_size)
+            self._sample_random_indices(batch_size)
             if indx is None
             else np.asarray(indx, dtype=np.int64)
         )
@@ -199,7 +306,7 @@ class HiQLDataset:
         high_trajectory_targets = np.minimum(
             indices + self.way_steps, high_trajectory_goals
         )
-        random_high_goals = np.random.randint(len(self), size=batch_size)
+        random_high_goals = self._sample_random_indices(batch_size)
         use_random_high_goal = np.random.rand(batch_size) < self.high_p_randomgoal
         high_goal_indices = np.where(
             use_random_high_goal, random_high_goals, high_trajectory_goals
@@ -214,17 +321,25 @@ class HiQLDataset:
             if self.terminal
             else np.ones(batch_size, dtype=np.float32)
         )
-        return {
-            "observations": self._gather_observations(indices),
-            "next_observations": self._gather_observations(indices, prefix="next_obs"),
-            "actions": self._gather_actions(indices),
+
+        # Gather every indexed field together so each trajectory and each
+        # compressed NPZ member is visited only once for this sample.
+        batch = self._gather_batch(
+            {
+                "observations": (indices, "obs"),
+                "next_observations": (indices, "next_obs"),
+                "goals": (goal_indices, "obs"),
+                "low_goals": (way_indices, "obs"),
+                "high_goals": (high_goal_indices, "obs"),
+                "high_targets": (high_target_indices, "obs"),
+            },
+            action_indices=indices,
+        )
+        batch.update({
             "rewards": success * self.reward_scale + self.reward_shift,
             "masks": masks,
-            "goals": self._gather_observations(goal_indices),
-            "low_goals": self._gather_observations(way_indices),
-            "high_goals": self._gather_observations(high_goal_indices),
-            "high_targets": self._gather_observations(high_target_indices),
-        }
+        })
+        return batch
 
 def expectile_loss(adv, diff, expectile=0.7):
     weight = jnp.where(adv >= 0, expectile, (1 - expectile))
@@ -570,6 +685,9 @@ def train(config):
         geom_sample=int(_get(config, "model.geom_sample", 0)),
         discount=float(_get(config, "model.discount", 0.99)),
         high_p_randomgoal=float(_get(config, "model.high_p_randomgoal", 0.0)),
+        trajectories_per_batch=_get(
+            config, "dataset.trajectories_per_batch", None
+        ),
     )
 
     print("\ndataset size:", len(pretrain_dataset))
@@ -579,6 +697,10 @@ def train(config):
     log_interval = int(_get(config, "training.log_interval", 100))
     save_interval = int(_get(config, "training.save_interval", 1000))
     checkpoint_dir = _get(config, "training.checkpoint_dir", "checkpoints/hiql")
+    train_log_path = _get(
+        config, "training.log_path", "hiql_train_log.csv"
+    )
+    train_logger = CsvLogger(train_log_path)
 
 
     one_sampling_start = time.time()
@@ -620,7 +742,7 @@ def train(config):
                      desc="HIQL Training", 
                      unit="step", 
                      dynamic_ncols=True):
-        # print("step:", step)
+        
         batch_sampling_start = time.time()
         batch = pretrain_dataset.sample(batch_size)
         batch_sampling_end = time.time()
@@ -628,26 +750,6 @@ def train(config):
         if step == 1:
             print(f"Batch sampling time: {batch_sampling_end - batch_sampling_start:.4f} seconds")
         
-        """
-        
-        if step < 5: 
-            batch_np = {
-                k: np.asarray(v)
-                for k, v in batch.items()
-            }
-
-            reward_sum = batch_np["rewards"].sum()
-            mask_sum = batch_np["masks"].sum()
-            goal_match = (batch_np["rewards"] == 1).mean()
-            
-            print(
-                f"[dataset-check] reward_mean={batch_np['rewards'].mean():.4f} "
-                f"mask_mean={batch_np['masks'].mean():.4f} "
-                f"reward+mask_sum={reward_sum + mask_sum:.4f} "   # higher than 1.0
-                f"goal_match_rate={goal_match:.4f}"    # between 0~1
-                f"final badge observation: {batch_np['goals'][0][-10:]}"
-            )
-        """
         pre_train_s = time.time()
         agent, info = agent.pretrain_update(
             batch,
@@ -663,6 +765,7 @@ def train(config):
         if step % log_interval == 0 or step == 1:
             info = tree_map(lambda x: float(np.asarray(x)) if isinstance(x, (np.ndarray, jnp.ndarray)) else x, info)
             info_str = " ".join([f"{k}={v:.6f}" for k, v in info.items()])
+            train_logger.log(dict(info), step)
             # policy_rep_fn = agent.get_policy_rep
             # base_observation = jax.tree_map(lambda arr: arr[0], pretrain_dataset.dataset['observations'])
             print(f"step={step} {info_str}")
@@ -671,3 +774,5 @@ def train(config):
         if step % save_interval == 0 or step == max_steps:
             save_checkpoint(checkpoint_dir, agent, step)
             print(f"saved checkpoint step={step} to {checkpoint_dir}")
+
+    train_logger.close()

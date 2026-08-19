@@ -10,7 +10,10 @@ python offline_dataset_generate.py
 
 python main.py --model dt
 
+4. 평가
+python hiql_evaluation.py   --checkpoint checkpoints/hiql_0804/hiql_10000.msgpack   --episodes 300   --max-episode-steps 50000 --eval-temperature 0.5 --log-interval 1000
 
+python hiql_run_pretrained.py  --checkpoint checkpoints/hiql_0804/hiql_10000.msgpack --eval-temperature 0.5
 
 그외.
 

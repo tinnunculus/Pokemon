@@ -3,6 +3,7 @@ import jax
 import numpy as np
 from collections import defaultdict
 import time
+import gymnasium as gym
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -56,6 +57,19 @@ def evaluate_with_trajectories(
         use_waypoints=False, eval_temperature=0, epsilon=0, goal_info=None,
         config=None,
 ) -> Dict[str, float]:
+    """Policy를 환경에서 실행하면서 통계와 transition trajectory를 수집한다.
+
+    이 함수는 학습 weight를 갱신하지 않는다. 현재 policy가 실제 환경에서
+    어떤 action을 선택하고 어떤 상태로 이동하는지 rollout하여 다음을 반환한다.
+
+    * stats: info 값의 평균과 마지막 episode return
+    * trajectories: observation/action/reward/done/info transition 목록
+    * renders: video episode를 요청했을 때 수집한 frame
+
+    Pokemon runner는 reset_env=False와 max_episode_steps=100을 전달하므로,
+    동일한 PyBoy game을 유지하면서 100-step 단위로 이 함수를 반복 호출한다.
+    """
+    config = {} if config is None else config
     trajectories = []
     stats = defaultdict(list)
 
@@ -76,7 +90,14 @@ def evaluate_with_trajectories(
             goal_loc = level_details.locs[target_state]
             env = ProcgenWrappedEnv(1, 'maze', cur_level, 1)
 
-        observation, done = env.reset(), False
+        if config.get('reset_env', True):
+            observation = env.reset()
+            # Gymnasium reset returns ``(observation, info)``.
+            if isinstance(observation, tuple) and len(observation) == 2:
+                observation = observation[0]
+        else:
+            observation = config['initial_observation']
+        done = False
 
         # Set goal
         if 'antmaze' in env_name:
@@ -95,19 +116,33 @@ def evaluate_with_trajectories(
             from src.envs.procgen_viz import get_xy_single
             observation = observation[0]
             obs_goal = goal_img
+        elif 'pokemon' in env_name.lower():
+            # Pokemon observation은 여러 배열을 담은 dict이지만 HIQL network는
+            # 하나의 vector를 입력받으므로 runner가 제공한 함수로 flatten한다.
+            observation_transform = config.get('observation_transform', lambda x: x)
+            observation = observation_transform(observation)
+            obs_goal = goal_info['goal']
         else:
             raise NotImplementedError
 
         render = []
         step = 0
+        info = {}
         while not done:
+            continue_condition = config.get('continue_condition')
+            if continue_condition is not None and not continue_condition():
+                break
             if not use_waypoints:
+                # Hierarchy를 쓰지 않을 때는 최종 goal(또는 그 representation)을
+                # low-level policy에 직접 전달한다.
                 cur_obs_goal = obs_goal
                 if config['use_rep']:
                     cur_obs_goal_rep = policy_rep_fn(targets=cur_obs_goal, bases=observation)
                 else:
                     cur_obs_goal_rep = cur_obs_goal
             else:
+                # HIQL의 high-level actor가 (현재 상태, 최종 goal)을 보고
+                # low-level actor가 따라갈 latent waypoint를 매 step 선택한다.
                 cur_obs_goal = high_policy_fn(observations=observation, goals=obs_goal, temperature=eval_temperature)
                 if config['use_rep']:
                     cur_obs_goal = cur_obs_goal / np.linalg.norm(cur_obs_goal, axis=-1, keepdims=True) * np.sqrt(cur_obs_goal.shape[-1])
@@ -115,6 +150,8 @@ def evaluate_with_trajectories(
                     cur_obs_goal = observation + cur_obs_goal
                 cur_obs_goal_rep = cur_obs_goal
 
+            # low-level actor는 (현재 상태, waypoint)의 categorical distribution을
+            # 만들고 실제 환경에 전달할 discrete action 하나를 sample한다.
             action = policy_fn(observations=observation, goals=cur_obs_goal_rep, low_dim_goals=True, temperature=eval_temperature)
             if 'antmaze' in env_name:
                 next_observation, r, done, info = env.step(action)
@@ -142,8 +179,25 @@ def evaluate_with_trajectories(
                     done = True
 
                 cur_render = next_observation
+            elif 'pokemon' in env_name.lower():
+                # JAX scalar를 Python int로 바꿔 PyBoy environment를 한 step 진행한다.
+                step_result = env.step(int(np.asarray(action).item()))
+                if len(step_result) == 5:
+                    raw_next_observation, r, terminated, truncated, info = step_result
+                    done = bool(terminated or truncated)
+                else:  # Compatibility with the legacy four-value Gym API.
+                    raw_next_observation, r, done, info = step_result
+                next_observation = observation_transform(raw_next_observation)
+
+                stop_condition = config.get('stop_condition')
+                if stop_condition is not None:
+                    done = done or bool(stop_condition(raw_next_observation))
 
             step += 1
+
+            max_episode_steps = config.get('max_episode_steps')
+            if max_episode_steps is not None and step >= max_episode_steps:
+                done = True
 
             # Render
             if 'procgen' in env_name:
@@ -188,7 +242,7 @@ def evaluate_with_trajectories(
             observation = next_observation
         if 'calvin' in env_name:
             info['return'] = sum(trajectory['reward'])
-        elif 'procgen' in env_name:
+        elif 'procgen' in env_name or 'pokemon' in env_name.lower():
             info['return'] = sum(trajectory['reward'])
         add_to(stats, flatten(info, parent_key="final"))
         trajectories.append(trajectory)

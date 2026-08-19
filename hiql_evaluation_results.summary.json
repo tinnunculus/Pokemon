@@ -1,0 +1,12 @@
+{
+  "checkpoint": "/home/yeonlife/rl_project/PokemonofflineRL/checkpoints/hiql_0804/hiql_10000.msgpack",
+  "episodes": 300,
+  "success_count": 0,
+  "failure_count": 300,
+  "success_rate": 0.0,
+  "average_return": 78.59656279388864,
+  "average_steps": 50000.0,
+  "max_episode_steps": 50000,
+  "eval_temperature": 0.5,
+  "success_condition": "badges[-1] == 1"
+}

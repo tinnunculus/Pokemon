@@ -76,7 +76,9 @@ class GCDataset:
             batch['masks'] = (1.0 - success.astype(float))
         else:
             batch['masks'] = np.ones(batch_size)
-        batch['goals'] = jax.tree_map(lambda arr: arr[goal_indx], self.dataset['observations'])
+        batch['goals'] = jax.tree_util.tree_map(
+            lambda arr: arr[goal_indx], self.dataset['observations']
+        )
 
         return batch
 
@@ -113,11 +115,15 @@ class GCSDataset(GCDataset):
         else:
             batch['masks'] = np.ones(batch_size)
 
-        batch['goals'] = jax.tree_map(lambda arr: arr[goal_indx], self.dataset['observations'])
+        batch['goals'] = jax.tree_util.tree_map(
+            lambda arr: arr[goal_indx], self.dataset['observations']
+        )
 
         final_state_indx = self.terminal_locs[np.searchsorted(self.terminal_locs, indx)]
         way_indx = np.minimum(indx + self.way_steps, final_state_indx)
-        batch['low_goals'] = jax.tree_map(lambda arr: arr[way_indx], self.dataset['observations'])
+        batch['low_goals'] = jax.tree_util.tree_map(
+            lambda arr: arr[way_indx], self.dataset['observations']
+        )
 
         distance = np.random.rand(batch_size)
 
@@ -131,8 +137,12 @@ class GCSDataset(GCDataset):
         high_goal_idx = np.where(pick_random, high_random_goal_indx, high_traj_goal_indx)
         high_target_idx = np.where(pick_random, high_random_target_indx, high_traj_target_indx)
 
-        batch['high_goals'] = jax.tree_map(lambda arr: arr[high_goal_idx], self.dataset['observations'])
-        batch['high_targets'] = jax.tree_map(lambda arr: arr[high_target_idx], self.dataset['observations'])
+        batch['high_goals'] = jax.tree_util.tree_map(
+            lambda arr: arr[high_goal_idx], self.dataset['observations']
+        )
+        batch['high_targets'] = jax.tree_util.tree_map(
+            lambda arr: arr[high_target_idx], self.dataset['observations']
+        )
 
         if isinstance(batch['goals'], FrozenDict):
             # Freeze the other observations
